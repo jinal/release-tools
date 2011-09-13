@@ -1,0 +1,11 @@
+lolapps-release-tools
+---------------------
+
+This is a collection of scripts and other small programs we use in our releases.
+
+Contents:
+    schema_differ
+        Compares two schemas and prints differences; some are "errors" and some are "warnings".
+        Python 2.5+, SQLAlchemy 0.4.8+
+
+

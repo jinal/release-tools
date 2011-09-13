@@ -1,0 +1,166 @@
+#!/usr/bin/env python
+"""
+Script to compare schemas. Intended usage: make sure that the staging schema ('left') matches the 
+production schema ('right') before allowing a deploy.
+
+Compares one database at a time. If you have multiple databases, then invoke this script once 
+for each database.
+
+Some differences are "warnings" while others are "errors".
+Warnings: 
+    extra tables in 'right'
+    extra columns/indexes in 'right'
+Errors: 
+    missing or different tables in 'right'
+    missing or different columns in 'right'
+    missing, extra, or different primary key in left vs. right
+    missing, extra, or different table options (default charset, engine, etc.) in left vs. right
+
+Usage:
+./schema_differ <left_engine_url> <right_engine_url>
+
+Example:
+./schema_differ mysql://user@devdb/dbname mysql://user:pass@proddb/dbname
+"""
+
+import sys
+
+import sqlalchemy as sa
+
+
+class SchemaDiffer(object):
+    def __init__(self, left_url, right_url):
+        self.left_engine = sa.create_engine(left_url)
+        self.right_engine = sa.create_engine(right_url)
+        self.errors = []
+        self.warnings = []
+
+    def execute(self):
+        self.diff_all_tables()
+        self.diff_all_columns()
+
+    def diff_all_tables(self):
+        left = set(self.left_engine.table_names())
+        right = set(self.right_engine.table_names())  
+
+        extra = right - left
+        if extra:
+            self.warnings.append('Extra tables: %s' % ', '.join(extra))
+
+        missing = left - right
+        if missing:
+            self.errors.append('Missing tables: %s' % ', '.join(missing))
+
+    def diff_all_columns(self):
+        left_table_names = self.left_engine.table_names()
+        right_table_names = self.right_engine.table_names()
+        for table_name in left_table_names:
+            if table_name not in right_table_names:
+                # already handled in diff_all_tables
+                continue
+            self.diff_table(table_name)
+
+    def diff_table(self, table_name):
+        left_metadata, right_metadata = sa.MetaData(), sa.MetaData()
+        left_table = sa.Table(table_name, left_metadata, autoload=True, 
+            autoload_with=self.left_engine)
+        right_table = sa.Table(table_name, right_metadata, autoload=True, 
+            autoload_with=self.right_engine)
+
+        self.diff_columns(table_name, left_table, right_table)
+        self.diff_indexes(table_name, left_table, right_table)
+        self.diff_primary_key(table_name, left_table, right_table)
+        self.diff_options(table_name, left_table, right_table)
+    
+    def diff_columns(self, table_name, left_table, right_table):
+        self._diff_table_items(table_name, left_table, right_table, 'columns')
+
+    def diff_indexes(self, table_name, left_table, right_table):
+        self._diff_table_items(table_name, left_table, right_table, 'indexes')
+
+    def _diff_table_items(self, table_name, left_table, right_table, attr):
+        # we do not care about order.
+        left_items = dict((col.name, col) for col in list(getattr(left_table, attr)))
+        right_items = dict((col.name, col) for col in list(getattr(right_table, attr)))
+
+        left_names = set(left_items.keys())
+        right_names = set(right_items.keys())
+        extra = right_names - left_names
+        if extra:
+            self.warnings.append('Extra %s in table %s: %s' % (attr, table_name, ', '.join(extra)))
+        missing = left_names - right_names
+        if missing:
+            self.errors.append('Missing %s in table %s: %s' % 
+                (attr, table_name, ', '.join(missing)))
+
+        for item_name, left_item in left_items.iteritems():
+            if item_name not in right_items:
+                # already handled above
+                continue
+            left = repr(left_item)
+            right = repr(right_items[item_name])
+            if left != right:
+                self.errors.append('Inconsistent schema in %s.%s. '
+                    'Left has [%s]. Right has [%s].' % (table_name, item_name, left, right))
+
+    def diff_primary_key(self, table_name, left_table, right_table):
+        left_pk = left_table.primary_key
+        right_pk = right_table.primary_key
+        if left_pk and not right_pk:
+            self.errors.append('Missing primary key on table %s.' % table_name)
+            return
+        if right_pk and not left_pk:
+            self.errors.append('Extra primary key on table %s.' % table_name)
+            return
+
+        if left_pk and right_pk:
+            left = repr(list(left_table.primary_key.columns))
+            right = repr(list(right_table.primary_key.columns))
+            if left != right:
+                self.errors.append('Inconsistent primary key in table %s. '
+                    'Left has [%s]. Right has [%s].' % (table_name, left, right))
+
+    def diff_options(self, table_name, left_table, right_table):
+        left_options = left_table.kwargs
+        right_options = right_table.kwargs
+        if left_options != right_options:
+            self.errors.append('Inconsistent table options in table %s. '
+                'Left has [%r]. Right has [%r].' % (table_name, left_options, right_options))
+            
+
+def main(left_url, right_url):
+    print 'Diffing %s (left) against %s (right)...' % (left_url, right_url)
+    differ = SchemaDiffer(left_url, right_url)
+    differ.execute()
+    has_errors = False
+    if differ.errors:
+        has_errors = True
+        print '-----ERRORS-----'
+        for msg in differ.errors:
+            print msg
+        print
+    if differ.warnings:
+        print '----WARNINGS----'
+        for msg in differ.warnings:
+            print msg
+        print
+
+    print '%d error(s) and %d warning(s) found.' % (len(differ.errors), len(differ.warnings))
+
+    if has_errors:
+        sys.exit(1)
+
+
+def print_usage():
+    print 'Usage: ./schema_differ <left_engine_url> <right_engine_url>'
+
+
+if __name__ == '__main__':
+    try:
+        left_url = sys.argv[1]
+        right_url = sys.argv[2]
+    except IndexError:
+        print_usage()
+        sys.exit(1)
+    else:
+        main(left_url, right_url)
